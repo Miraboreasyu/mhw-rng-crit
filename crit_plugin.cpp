@@ -25,6 +25,9 @@
 //        5. `bag [N]` / `prd`         : Deterministic shuffle bag (w/ carry) & Dota-style PRD
 // ============================================================================
 #include "mhw_rng_api.h"
+#include "mhw_rng_math.h"
+#include "mhw_1523_world.h"
+#include "mhw_world_api.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -60,10 +63,10 @@ constexpr std::uintptr_t kOffCritCtxPlayer    = 0x0008U;
 constexpr std::uintptr_t kOffHitInfoAtkNode   = 0x0038U; // HitInfo -> attacking cNode*
 constexpr std::uintptr_t kOffNodeOrigAtkParam = 0x00A8U; // cNode   -> immutable original cAttackParam*
 constexpr std::uintptr_t kOffHitSubCritFlag   = 0x0040U; // == 1 triggers crit-draw flag
-constexpr std::uintptr_t kOffPlayerWeapon     = 0x76B0U; // uWeapon*
-constexpr std::uintptr_t kOffPlayerStatusMgr  = 0x7D20U;
-constexpr std::uintptr_t kOffPlayerCritCursor = 0x8820U;
-constexpr std::uintptr_t kOffPlayerLocalFlags = 0x8938U; // bit 0 == 1 -> local player
+constexpr std::uintptr_t kOffPlayerWeapon     = mhw1523::kOffPlayerWeapon;
+constexpr std::uintptr_t kOffPlayerStatusMgr  = mhw1523::kOffPlayerStatusMgr;
+constexpr std::uintptr_t kOffPlayerCritCursor = mhw1523::kOffPlayerCritCursor;
+constexpr std::uintptr_t kOffPlayerLocalFlags = mhw1523::kOffPlayerLocalFlags;
 constexpr std::uintptr_t kOffWeaponValidMask  = 0x000CU; // (mask & 0x0E) != 0 -> valid weapon obj
 constexpr std::uintptr_t kOffWeaponType       = 0x09F8U; // uint32_t weapon type id
 constexpr std::uintptr_t kOffWeaponType3Flag  = 0x2398U; // uint8_t  type 3 alt-MV flag (0x142122e20)
@@ -168,6 +171,9 @@ CritMode                          g_mode                = CritMode::kVanilla;
 bool                              g_rateOverrideEnabled = false;
 int                               g_rateOverridePct     = 100;
 bool                              g_verbose             = false;
+bool                              g_autoResetOnQuest    = true;
+MhwRngHookHandle                  g_worldEvTitle        = kMhwRngInvalidHandle;
+MhwRngHookHandle                  g_worldEvQuest        = kMhwRngInvalidHandle;
 
 // Ratio / Sequence params & runtime state
 std::uint32_t                     g_ratioM         = 1U;
@@ -217,40 +223,9 @@ std::array<double, 100>           g_prdConstants{};
 // ============================================================================
 //  Deterministic Math Helpers (Exact MHW Xorshift128 + PRD Solver)
 // ============================================================================
-inline std::uint64_t SplitMix64(std::uint64_t x) noexcept {
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    return x ^ (x >> 31);
-}
-
-inline void DeriveMhwXorshift128(std::uint64_t baseSeed,
-                                 std::uint32_t rva,
-                                 std::uint32_t condId,
-                                 std::uint32_t outState[4]) noexcept {
-    const std::uint64_t comp = (static_cast<std::uint64_t>(condId) << 32) | rva;
-    const std::uint64_t mix1 = SplitMix64(baseSeed ^ (comp * 0xD6E8FEB86659FD93ULL));
-    const std::uint64_t mix2 = SplitMix64(mix1 ^ (comp + 0x9E3779B97F4A7C15ULL));
-    outState[0] = static_cast<std::uint32_t>(mix1);
-    outState[1] = static_cast<std::uint32_t>(mix1 >> 32);
-    outState[2] = static_cast<std::uint32_t>(mix2);
-    outState[3] = static_cast<std::uint32_t>(mix2 >> 32);
-    if ((outState[0] | outState[1] | outState[2] | outState[3]) == 0U) {
-        outState[0] = 0x13579BDFU;
-        outState[3] = 0x2468ACE1U;
-    }
-}
-
-inline std::uint32_t StepMhwXorshift128(std::uint32_t s[4]) noexcept {
-    std::uint32_t t = (s[0] << 15) ^ s[0];
-    s[0] = s[1];
-    s[1] = s[2];
-    const std::uint32_t w = s[3];
-    s[2] = w;
-    t = ((w >> 17) ^ t) >> 4 ^ w ^ t;
-    s[3] = t;
-    return t;
-}
+using mhw_sdk::SplitMix64;
+using mhw_sdk::DeriveMhwXorshift128;
+using mhw_sdk::StepMhwXorshift128;
 
 double PrdExpectedRate(double c) noexcept {
     double probFail = 1.0;
@@ -1259,6 +1234,14 @@ void __fastcall OnKernelLifecycle(const MhwRngEventInfo* info, void*) {
     }
 }
 
+void __fastcall OnWorldEvent(const MhwRngCustomEvent* ev, void*) {
+    if (!ev || !ev->topic) return;
+    std::lock_guard<std::mutex> lk(g_stateMx);
+    if (!g_autoResetOnQuest) return;
+    ResetRuntimeStreamsLocked();
+    ResetTelemetryLocked();
+}
+
 bool __fastcall FormatCritSlotStatus(const MhwRngSlotSnapshot* snap,
                                      char* outBuf,
                                      std::size_t bufCap,
@@ -1469,6 +1452,7 @@ void PrintCritStatus() {
     std::uint64_t                   neg      = 0ULL;
     double                          mvSum    = 0.0;
     double                          mvCrit   = 0.0;
+    bool                            autoReset = true;
     bool                            hasLast  = false;
     float                           lMv      = 0.0f;
     int                             lLive    = 0;
@@ -1477,10 +1461,11 @@ void PrintCritStatus() {
     float                           lMult    = 1.0f;
     {
         std::lock_guard<std::mutex> lk(g_stateMx);
-        mode     = g_mode;
-        ovrOn    = g_rateOverrideEnabled;
-        ovrPct   = g_rateOverridePct;
-        verbose  = g_verbose;
+        mode      = g_mode;
+        ovrOn     = g_rateOverrideEnabled;
+        ovrPct    = g_rateOverridePct;
+        verbose   = g_verbose;
+        autoReset = g_autoResetOnQuest;
         ratM     = g_ratioM;
         ratN     = g_ratioN;
         ratStyle = g_ratioStyle;
@@ -1513,12 +1498,17 @@ void PrintCritStatus() {
     if (ovrOn) std::snprintf(rateStr, sizeof(rateStr), "%d%%", ovrPct);
     else       std::snprintf(rateStr, sizeof(rateStr), "%s", en ? "auto (live panel+WEX)" : u8"auto (实时面板+弱特)");
 
-    g_host->ChatPrintf(en ? "[crit] Mode:%s | Rate:%s | Verbose:%s | Hook:%s"
-                          : u8"[会心] 模式:%s | 会心率:%s | 详细播报:%s | 钩子:%s",
+    g_host->ChatPrintf(en ? "[crit] Mode:%s | Rate:%s | Verbose:%s | AutoReset:%s | Hook:%s"
+                          : u8"[会心] 模式:%s | 会心率:%s | 详细播报:%s | 自动重置:%s | 钩子:%s",
                        ModeName(mode, en),
                        rateStr,
                        verbose ? "on" : "off",
+                       autoReset ? "on" : "off",
                        g_detourActive ? "active" : "inactive");
+    char worldBuf[128]{};
+    if (MhwWorld_TryFormatSummary(g_host, worldBuf, sizeof(worldBuf), en)) {
+        g_host->ChatPrintf(en ? "[crit] World context: %s" : u8"[会心] 世界上下文: %s", worldBuf);
+    }
 
     if (mode == CritMode::kRatio) {
         if (ratStyle == RatioStyle::kCustom) {
@@ -1587,6 +1577,8 @@ void PrintCritHelp() {
                          : u8"  bag [容量=10] | prd          - 确定性洗牌袋 (带小数进位) 或 PRD 渐进保底");
     g_host->ChatPrint(en ? "  verbose [on|off] | reset     - Toggle per-hit chat log | reset stats & stream state"
                          : u8"  verbose [on|off] | reset     - 开关每跳播报 | 重置统计与内部游标/预算池");
+    g_host->ChatPrint(en ? "  autoreset [on|off]           - Auto reset stats/streams on quest enter or title return"
+                         : u8"  autoreset [on|off]           - 进出任务/回标题时自动重置统计与流状态");
 }
 
 // Handles `random`, `ratio`, `seq`, `mv_bank`, `mv_tier`, `bag`, `prd`, `observe`, `vanilla`/`off`
@@ -1956,6 +1948,30 @@ void __fastcall Cmd_Crit(int argc, const char* const* argv, const char*, void*) 
         return;
     }
 
+    if (sub == "autoreset" || sub == "ar") {
+        bool nextVal = true;
+        {
+            std::lock_guard<std::mutex> lk(g_stateMx);
+            if (argc >= 2 && argv[1]) {
+                const std::string v = LowerAscii(argv[1]);
+                if (v == "on" || v == "1" || v == "true")       nextVal = true;
+                else if (v == "off" || v == "0" || v == "false") nextVal = false;
+                else {
+                    g_host->ChatPrint(en ? "[crit] Usage: $rng crit autoreset [on|off]"
+                                         : u8"[会心] 用法: $rng crit autoreset [on|off]");
+                    return;
+                }
+            } else {
+                nextVal = !g_autoResetOnQuest;
+            }
+            g_autoResetOnQuest = nextVal;
+        }
+        g_host->ChatPrintf(en ? "[crit] Auto reset stats/streams on quest enter or title return: %s."
+                              : u8"[会心] 进出任务/回标题自动重置统计与流状态: %s。",
+                           nextVal ? "on" : "off");
+        return;
+    }
+
     if (sub == "reset") {
         {
             std::lock_guard<std::mutex> lk(g_stateMx);
@@ -2040,7 +2056,7 @@ void __fastcall Complete_Crit(const char*,
         static const char* const kTop[] = {
             "status", "help", "off", "vanilla", "observe", "rate", "mode",
             "random", "ratio", "seq", "mv_bank", "mv_tier", "bag", "prd",
-            "verbose", "reset"
+            "verbose", "autoreset", "reset"
         };
         for (const char* t : kTop) addCand(t, sinkCtx);
         return;
@@ -2052,7 +2068,7 @@ void __fastcall Complete_Crit(const char*,
         if (a0 == "rate") {
             static const char* const kRates[] = { "auto", "0", "25", "50", "75", "100", "-30", "-100" };
             for (const char* r : kRates) addCand(r, sinkCtx);
-        } else if (a0 == "verbose" || a0 == "v") {
+        } else if (a0 == "verbose" || a0 == "v" || a0 == "autoreset" || a0 == "ar") {
             addCand("on", sinkCtx);
             addCand("off", sinkCtx);
         } else if (a0 == "mode") {
@@ -2123,6 +2139,8 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
     hk.postFn     = &OnCritSeedPost;
     g_hookSeed    = host->RegisterSlotHookEx(selfId, &hk);
     g_hookLife    = host->RegisterLifecycleHook(selfId, &OnKernelLifecycle, nullptr);
+    g_worldEvTitle = MhwRng_HostSubscribeEvent(host, selfId, kMhwWorldEvTitleReturn, &OnWorldEvent, nullptr);
+    g_worldEvQuest = MhwRng_HostSubscribeEvent(host, selfId, kMhwWorldEvQuestEnter,  &OnWorldEvent, nullptr);
 
     MhwRng_RegisterSubcommandBi(
         host, selfId,
@@ -2143,19 +2161,32 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
 
 MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() {
     UninstallCritDetour();
+    const MhwRngHostApi* hostCopy = nullptr;
+    MhwRngPluginId       selfCopy = 0U;
+    MhwRngHookHandle     ev1      = kMhwRngInvalidHandle;
+    MhwRngHookHandle     ev2      = kMhwRngInvalidHandle;
     {
         std::lock_guard<std::mutex> lk(g_stateMx);
+        hostCopy              = g_host;
+        selfCopy              = g_selfId;
+        ev1                   = g_worldEvTitle;
+        ev2                   = g_worldEvQuest;
+        g_worldEvTitle        = kMhwRngInvalidHandle;
+        g_worldEvQuest        = kMhwRngInvalidHandle;
         g_mode                = CritMode::kVanilla;
         g_rateOverrideEnabled = false;
         g_rateOverridePct     = 100;
         g_verbose             = false;
+        g_autoResetOnQuest    = true;
         g_customSeq.clear();
         ResetRuntimeStreamsLocked();
         ResetTelemetryLocked();
+        g_host                = nullptr;
+        g_selfId              = 0U;
     }
+    MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, ev1);
+    MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, ev2);
     g_drawDetFn.store(nullptr, std::memory_order_release);
     g_hookSeed = kMhwRngInvalidHandle;
     g_hookLife = kMhwRngInvalidHandle;
-    g_host     = nullptr;
-    g_selfId   = 0U;
 }
