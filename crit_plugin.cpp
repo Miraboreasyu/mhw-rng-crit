@@ -28,6 +28,7 @@
 #include "mhw_rng_math.h"
 #include "mhw_1523_world.h"
 #include "mhw_world_api.h"
+#include "mhw_crit_api.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -2095,11 +2096,422 @@ void __fastcall Complete_Crit(const char*,
     }
 }
 
+// ============================================================================
+//  MIRA v3.5 Companion Service (`"mhw.crit"`, v1)
+// ============================================================================
+
+void CopyTruncCrit(char* dst, std::size_t cap, const char* src) noexcept {
+    if (!dst || cap == 0U) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    std::size_t i = 0U;
+    while (i + 1U < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        ++i;
+    }
+    dst[i] = '\0';
+}
+
+bool WriteBufExactCrit(char* dst, std::size_t cap, const std::string& val) noexcept {
+    if (!dst) return true;
+    if (cap == 0U) return false;
+    CopyTruncCrit(dst, cap, val.c_str());
+    return (val.size() + 1U <= cap);
+}
+
+std::string FormatCleanDoubleCrit(double v) {
+    char buf[48]{};
+    std::snprintf(buf, sizeof(buf), "%.6g", v);
+    return std::string(buf);
+}
+
+std::vector<std::string> SplitWhitespaceCrit(const char* text) {
+    std::vector<std::string> toks;
+    if (!text) return toks;
+    const char* p = text;
+    while (*p != '\0') {
+        while (*p != '\0' && std::isspace(static_cast<unsigned char>(*p))) ++p;
+        if (*p == '\0') break;
+        const char* start = p;
+        while (*p != '\0' && !std::isspace(static_cast<unsigned char>(*p))) ++p;
+        toks.emplace_back(start, static_cast<std::size_t>(p - start));
+    }
+    return toks;
+}
+
+std::uint64_t __fastcall Svc_CritGetTotalHits() {
+    std::lock_guard<std::mutex> lk(g_stateMx);
+    return g_totalHits;
+}
+
+bool __fastcall Svc_CritGetConfigSnapshot(char*       outModeCmd,
+                                          std::size_t modeCap,
+                                          char*       outRateStr,
+                                          std::size_t rateCap) {
+    CritMode                         mode     = CritMode::kVanilla;
+    bool                             ovrOn    = false;
+    int                              ovrPct   = 100;
+    std::uint32_t                    ratM     = 1U;
+    std::uint32_t                    ratN     = 1U;
+    RatioStyle                       ratStyle = RatioStyle::kBlock;
+    std::vector<std::int8_t>         seq;
+    double                           mvTh     = 50.0;
+    double                           bankRes  = 1.0;
+    std::size_t                      tCutCnt  = 2U;
+    std::array<double, kMaxTierCuts> tCuts{};
+    TierAffKind                      tKind    = TierAffKind::kDelta;
+    std::array<int, kMaxTiers>       tVals{};
+    std::size_t                      bagSz    = 10U;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        mode     = g_mode;
+        ovrOn    = g_rateOverrideEnabled;
+        ovrPct   = g_rateOverridePct;
+        ratM     = g_ratioM;
+        ratN     = g_ratioN;
+        ratStyle = g_ratioStyle;
+        seq      = g_customSeq;
+        mvTh     = g_mvThreshold;
+        bankRes  = g_bankReserve;
+        tCutCnt  = g_tierCutCount;
+        tCuts    = g_tierCuts;
+        tKind    = g_tierAffKind;
+        tVals    = g_tierAffVals;
+        bagSz    = g_bagSize;
+    }
+
+    std::string modeStr;
+    switch (mode) {
+        case CritMode::kVanilla:
+            modeStr = "vanilla";
+            break;
+        case CritMode::kObserve:
+            modeStr = "observe";
+            break;
+        case CritMode::kRandom:
+            modeStr = "random";
+            break;
+        case CritMode::kRatio:
+            if (ratStyle == RatioStyle::kCustom && !seq.empty()) {
+                modeStr = "seq ";
+                modeStr.reserve(4U + seq.size());
+                for (std::int8_t v : seq) {
+                    modeStr.push_back(v > 0 ? '1' : (v < 0 ? '-' : '0'));
+                }
+            } else {
+                modeStr = "ratio " + std::to_string(ratM) + ":" + std::to_string(ratN) +
+                          (ratStyle == RatioStyle::kSpread ? " spread" : " block");
+            }
+            break;
+        case CritMode::kMvBank:
+            modeStr = "mv_bank " + FormatCleanDoubleCrit(mvTh) + " " + FormatCleanDoubleCrit(bankRes);
+            break;
+        case CritMode::kMvTier: {
+            modeStr = "mv_tier";
+            for (std::size_t i = 0U; i < tCutCnt && i < kMaxTierCuts; ++i) {
+                modeStr.push_back(' ');
+                modeStr += FormatCleanDoubleCrit(tCuts[i]);
+            }
+            modeStr += (tKind == TierAffKind::kFixed) ? " rate=" : " delta=";
+            const std::size_t nTiers = (std::min)(tCutCnt + 1U, kMaxTiers);
+            for (std::size_t i = 0U; i < nTiers; ++i) {
+                if (i > 0U) modeStr.push_back(',');
+                modeStr += std::to_string(tVals[i]);
+            }
+            break;
+        }
+        case CritMode::kBag:
+            modeStr = "bag " + std::to_string(bagSz);
+            break;
+        case CritMode::kPrd:
+            modeStr = "prd";
+            break;
+    }
+
+    const std::string rateStr = ovrOn ? std::to_string(ovrPct) : std::string("auto");
+
+    bool ok = true;
+    ok &= WriteBufExactCrit(outModeCmd, modeCap, modeStr);
+    ok &= WriteBufExactCrit(outRateStr, rateCap, rateStr);
+    return ok;
+}
+
+bool __fastcall Svc_CritApplyConfig(const char* modeCmd,
+                                    const char* rateStr,
+                                    char*       outErr,
+                                    std::size_t errCap) {
+    if (outErr && errCap > 0U) outErr[0] = '\0';
+
+    // 1. Parse rateStr unlocked (`auto` or integer in `-100..100`)
+    bool ovrOn  = false;
+    int  ovrPct = 100;
+    {
+        const auto rateToks = SplitWhitespaceCrit(rateStr);
+        if (rateToks.size() > 1U) {
+            CopyTruncCrit(outErr, errCap, "invalid rate string (expected `auto` or single integer in -100..100)");
+            return false;
+        }
+        if (rateToks.size() == 1U) {
+            const std::string low = LowerAscii(rateToks[0].c_str());
+            if (low == "auto" || low == "panel" || low == "game") {
+                ovrOn = false;
+            } else {
+                int pct = 0;
+                if (!ParseIntStrict(rateToks[0].c_str(), pct) || pct < -100 || pct > 100) {
+                    const std::string msg = "invalid rate `" + rateToks[0] + "` (expected auto or -100..100)";
+                    CopyTruncCrit(outErr, errCap, msg.c_str());
+                    return false;
+                }
+                ovrOn  = true;
+                ovrPct = pct;
+            }
+        }
+    }
+
+    // 2. Parse modeCmd unlocked (all 8 modes + `off` alias, optional leading `mode`)
+    auto toks = SplitWhitespaceCrit(modeCmd);
+    if (toks.size() >= 2U && LowerAscii(toks[0].c_str()) == "mode") {
+        toks.erase(toks.begin());
+    }
+
+    CritMode                         nextMode     = CritMode::kVanilla;
+    std::uint32_t                    nextRatM     = 1U;
+    std::uint32_t                    nextRatN     = 1U;
+    RatioStyle                       nextRatStyle = RatioStyle::kBlock;
+    std::vector<std::int8_t>         nextSeq;
+    double                           nextMvTh     = 50.0;
+    double                           nextBankRes  = 1.0;
+    std::size_t                      nextTierCnt  = 2U;
+    std::array<double, kMaxTierCuts> nextTierCuts = { 25.0, 60.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    TierAffKind                      nextTierKind = TierAffKind::kDelta;
+    std::array<int, kMaxTiers>       nextTierVals = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    std::size_t                      nextBagSz    = 10U;
+
+    if (!toks.empty()) {
+        const std::string mName = LowerAscii(toks[0].c_str());
+        if (mName == "off" || mName == "vanilla") {
+            if (toks.size() > 1U) {
+                CopyTruncCrit(outErr, errCap, "unexpected extra args for vanilla mode");
+                return false;
+            }
+            nextMode = CritMode::kVanilla;
+        } else if (mName == "observe" || mName == "obs") {
+            if (toks.size() > 1U) {
+                CopyTruncCrit(outErr, errCap, "unexpected extra args for observe mode");
+                return false;
+            }
+            nextMode = CritMode::kObserve;
+        } else if (mName == "random" || mName == "pure") {
+            if (toks.size() > 1U) {
+                CopyTruncCrit(outErr, errCap, "unexpected extra args for random mode");
+                return false;
+            }
+            nextMode = CritMode::kRandom;
+        } else if (mName == "ratio") {
+            if (toks.size() < 2U || toks.size() > 3U) {
+                CopyTruncCrit(outErr, errCap, "expected `ratio <m:n> [block|spread]`");
+                return false;
+            }
+            if (!ParseRatioPair(toks[1].c_str(), nextRatM, nextRatN)) {
+                const std::string msg = "invalid ratio `" + toks[1] + "`";
+                CopyTruncCrit(outErr, errCap, msg.c_str());
+                return false;
+            }
+            nextRatStyle = RatioStyle::kBlock;
+            if (toks.size() == 3U) {
+                const std::string st = LowerAscii(toks[2].c_str());
+                if (st == "spread" || st == "even" || st == "bresenham") nextRatStyle = RatioStyle::kSpread;
+                else if (st == "block" || st == "seq")                   nextRatStyle = RatioStyle::kBlock;
+                else {
+                    const std::string msg = "unknown ratio style `" + toks[2] + "` (expected block|spread)";
+                    CopyTruncCrit(outErr, errCap, msg.c_str());
+                    return false;
+                }
+            }
+            nextMode = CritMode::kRatio;
+        } else if (mName == "seq") {
+            if (toks.size() != 2U) {
+                CopyTruncCrit(outErr, errCap, "expected `seq <pattern>`");
+                return false;
+            }
+            if (!ParseCustomSeqPattern(toks[1].c_str(), nextSeq)) {
+                const std::string msg = "invalid seq pattern `" + toks[1] + "`";
+                CopyTruncCrit(outErr, errCap, msg.c_str());
+                return false;
+            }
+            nextMode     = CritMode::kRatio;
+            nextRatStyle = RatioStyle::kCustom;
+        } else if (mName == "mv_bank" || mName == "bank" || mName == "mv") {
+            if (toks.size() > 3U) {
+                CopyTruncCrit(outErr, errCap, "expected `mv_bank [mvTh] [reserve]`");
+                return false;
+            }
+            double mvTh = 50.0;
+            double res  = 1.0;
+            if (toks.size() >= 2U && !ParseDoubleStrict(toks[1].c_str(), mvTh)) {
+                const std::string msg = "invalid mv_bank threshold `" + toks[1] + "`";
+                CopyTruncCrit(outErr, errCap, msg.c_str());
+                return false;
+            }
+            if (toks.size() >= 3U && !ParseDoubleStrict(toks[2].c_str(), res)) {
+                const std::string msg = "invalid mv_bank reserve `" + toks[2] + "`";
+                CopyTruncCrit(outErr, errCap, msg.c_str());
+                return false;
+            }
+            nextMode    = CritMode::kMvBank;
+            nextMvTh    = (std::max)(1.0, (std::min)(500.0, mvTh));
+            nextBankRes = (std::max)(0.0, (std::min)(10.0, res));
+        } else if (mName == "mv_tier" || mName == "tier") {
+            std::vector<double> cuts;
+            std::vector<int>    affVals;
+            bool hasDelta = false;
+            bool hasRate  = false;
+            for (std::size_t i = 1U; i < toks.size(); ++i) {
+                const std::string low = LowerAscii(toks[i].c_str());
+                if (StartsWithNoCase(low, "delta=")) {
+                    if (hasDelta || hasRate) {
+                        CopyTruncCrit(outErr, errCap, "duplicate or conflicting delta=/rate= in mv_tier");
+                        return false;
+                    }
+                    if (!ParseTierIntList(toks[i].c_str() + 6, affVals)) {
+                        const std::string msg = "invalid mv_tier delta list `" + toks[i] + "`";
+                        CopyTruncCrit(outErr, errCap, msg.c_str());
+                        return false;
+                    }
+                    hasDelta = true;
+                } else if (StartsWithNoCase(low, "rate=")) {
+                    if (hasDelta || hasRate) {
+                        CopyTruncCrit(outErr, errCap, "duplicate or conflicting delta=/rate= in mv_tier");
+                        return false;
+                    }
+                    if (!ParseTierIntList(toks[i].c_str() + 5, affVals)) {
+                        const std::string msg = "invalid mv_tier rate list `" + toks[i] + "`";
+                        CopyTruncCrit(outErr, errCap, msg.c_str());
+                        return false;
+                    }
+                    hasRate = true;
+                } else {
+                    double cut = 0.0;
+                    if (!ParseDoubleStrict(toks[i].c_str(), cut) || cut <= 0.0 || cut > 10000.0) {
+                        const std::string msg = "invalid mv_tier cutoff `" + toks[i] + "`";
+                        CopyTruncCrit(outErr, errCap, msg.c_str());
+                        return false;
+                    }
+                    if (!cuts.empty() && cut <= cuts.back()) {
+                        CopyTruncCrit(outErr, errCap, "mv_tier cutoffs must be strictly ascending");
+                        return false;
+                    }
+                    if (cuts.size() >= kMaxTierCuts) {
+                        CopyTruncCrit(outErr, errCap, "too many mv_tier cutoffs (max 7)");
+                        return false;
+                    }
+                    cuts.push_back(cut);
+                }
+            }
+            if (cuts.empty()) {
+                cuts.push_back(25.0);
+                cuts.push_back(60.0);
+            }
+            const std::size_t nTiers = cuts.size() + 1U;
+            if (hasDelta || hasRate) {
+                if (affVals.size() != nTiers) {
+                    CopyTruncCrit(outErr, errCap, "mv_tier value count mismatch");
+                    return false;
+                }
+                for (int v : affVals) {
+                    if (v < -100 || v > 100) {
+                        CopyTruncCrit(outErr, errCap, "mv_tier value out of range [-100..100]");
+                        return false;
+                    }
+                }
+            } else {
+                affVals.assign(nTiers, 0);
+            }
+            nextMode     = CritMode::kMvTier;
+            nextTierCnt  = cuts.size();
+            nextTierCuts.fill(0.0);
+            nextTierVals.fill(0);
+            for (std::size_t i = 0U; i < cuts.size(); ++i) nextTierCuts[i] = cuts[i];
+            for (std::size_t i = 0U; i < nTiers; ++i)      nextTierVals[i] = affVals[i];
+            nextTierKind = hasRate ? TierAffKind::kFixed : TierAffKind::kDelta;
+        } else if (mName == "bag") {
+            if (toks.size() > 2U) {
+                CopyTruncCrit(outErr, errCap, "expected `bag [size]`");
+                return false;
+            }
+            int sz = 10;
+            if (toks.size() == 2U && !ParseIntStrict(toks[1].c_str(), sz)) {
+                const std::string msg = "invalid bag size `" + toks[1] + "`";
+                CopyTruncCrit(outErr, errCap, msg.c_str());
+                return false;
+            }
+            nextMode  = CritMode::kBag;
+            nextBagSz = static_cast<std::size_t>((std::max)(2, (std::min)(64, sz)));
+        } else if (mName == "prd") {
+            if (toks.size() > 1U) {
+                CopyTruncCrit(outErr, errCap, "unexpected extra args for prd mode");
+                return false;
+            }
+            EnsurePrdTable();
+            nextMode = CritMode::kPrd;
+        } else {
+            const std::string msg = "unknown crit mode `" + toks[0] + "`";
+            CopyTruncCrit(outErr, errCap, msg.c_str());
+            return false;
+        }
+    }
+
+    // 3. Atomic commit under leaf mutex (zero `g_host` calls!)
+    {
+        std::lock_guard<std::mutex> lk(g_stateMx);
+        g_rateOverrideEnabled = ovrOn;
+        g_rateOverridePct     = ovrOn ? ovrPct : 100;
+        g_mode                = nextMode;
+        if (nextMode == CritMode::kRatio) {
+            g_ratioStyle = nextRatStyle;
+            if (nextRatStyle == RatioStyle::kCustom) {
+                g_customSeq = std::move(nextSeq);
+            } else {
+                g_ratioM = nextRatM;
+                g_ratioN = nextRatN;
+            }
+        } else if (nextMode == CritMode::kMvBank) {
+            g_mvThreshold = nextMvTh;
+            g_bankReserve = nextBankRes;
+        } else if (nextMode == CritMode::kMvTier) {
+            g_tierCutCount = nextTierCnt;
+            g_tierCuts     = nextTierCuts;
+            g_tierAffKind  = nextTierKind;
+            g_tierAffVals  = nextTierVals;
+        } else if (nextMode == CritMode::kBag) {
+            g_bagSize = nextBagSz;
+        }
+        ResetRuntimeStreamsLocked();
+        ResetTelemetryLocked();
+    }
+
+    if (nextMode != CritMode::kVanilla && nextMode != CritMode::kObserve &&
+        g_host && g_host->GetEngineMode() == kMhwRngModeOff) {
+        g_host->SetTakeoverEnabled(true);
+    }
+    return true;
+}
+
+const MhwCritServiceApi kCritServiceApi = {
+    sizeof(MhwCritServiceApi),
+    kMhwCritApiVersion,
+    &Svc_CritGetTotalHits,
+    &Svc_CritGetConfigSnapshot,
+    &Svc_CritApplyConfig
+};
+
 const MhwRngPluginDescriptor kPluginDesc = {
     kMhwRngApiVersion,
     "crit",
     u8"攻击会心控制插件",
-    "1.0.0",
+    "1.1.0",
     u8"无视面板设定会心率，并支持纯随机/m:n序列/动作值预算池/分档流/洗牌袋/PRD保底"
 };
 
@@ -2161,6 +2573,7 @@ MHW_RNG_PLUGIN_EXPORT bool MhwRngPlugin_Init(const MhwRngHostApi* host, MhwRngPl
         host->Log(selfId, "[crit] Failed to install crit evaluator detour at RVA 0x%07X", kRvaApplyCrit);
         return false;
     }
+    MhwRng_HostRegisterService(host, selfId, kMhwCritServiceName, kMhwCritApiVersion, &kCritServiceApi);
     return true;
 }
 
@@ -2189,6 +2602,7 @@ MHW_RNG_PLUGIN_EXPORT void MhwRngPlugin_Shutdown() {
         g_host                = nullptr;
         g_selfId              = 0U;
     }
+    MhwRng_HostUnregisterService(hostCopy, selfCopy, kMhwCritServiceName);
     MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, ev1);
     MhwRng_HostUnsubscribeEvent(hostCopy, selfCopy, ev2);
     g_drawDetFn.store(nullptr, std::memory_order_release);
