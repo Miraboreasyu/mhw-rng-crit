@@ -1202,7 +1202,12 @@ void __fastcall OnCritSeedPre(const MhwRngDrawContext* ctx,
         mode = g_mode;
     }
     if (mode == CritMode::kVanilla || mode == CritMode::kObserve) {
-        ioDecision->action = kMhwRngActionBypass;
+        const bool isTakeover =
+            g_host &&
+            g_host->structSize >= offsetof(MhwRngHostApi, GetEngineMode) + sizeof(g_host->GetEngineMode) &&
+            g_host->GetEngineMode &&
+            g_host->GetEngineMode() == kMhwRngModeTakeover;
+        ioDecision->action = isTakeover ? kMhwRngActionContinue : kMhwRngActionBypass;
         return;
     }
     ioDecision->action = kMhwRngActionClaimCondition;
